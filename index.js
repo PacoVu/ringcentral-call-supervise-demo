@@ -1,67 +1,149 @@
-import RingCentral from '@ringcentral/sdk'
-import Subscriptions from '@ringcentral/subscriptions'
-import fs from 'fs'
-import { nonstandard } from 'wrtc'
-import Softphone from 'ringcentral-softphone'
+// SoftPhone
+require('dotenv').config()
+//const supervisor = require('./supervisor-engine')
 
-const { RTCAudioSink } = nonstandard
+const PhoneEngine = require('./supervisor-engine');
+let supervisor = new PhoneEngine()
 
-const rc = new RingCentral({
-  server: process.env.RINGCENTRAL_SERVER_URL,
-  clientId: process.env.RINGCENTRAL_CLIENT_ID,
-  clientSecret: process.env.RINGCENTRAL_CLIENT_SECRET
-})
+const http = require('http');
+var url = require('url');
+var eventResponse = null
 
-;(async () => {
-  await rc.login({
-    username: process.env.RINGCENTRAL_USERNAME,
-    extension: process.env.RINGCENTRAL_EXTENSION,
-    password: process.env.RINGCENTRAL_PASSWORD
-  })
-  const softphone = new Softphone(rc)
-  await softphone.register()
+http.createServer((request, response) => {
+  console.log(`Request url: ${request.url}`);
 
-  let audioSink
-  let audioStream
-  const audioPath = 'audio.raw'
-  if (fs.existsSync(audioPath)) {
-    fs.unlinkSync(audioPath)
-  }
-  softphone.on('INVITE', sipMessage => {
-    softphone.answer()
-    softphone.on('track', e => {
-      audioSink = new RTCAudioSink(e.track)
-      audioStream = fs.createWriteStream(audioPath, { flags: 'a' })
-      audioSink.ondata = data => {
-        console.log(`live audio data received, sample rate is ${data.sampleRate}`)
-        audioStream.write(Buffer.from(data.samples.buffer))
-      }
-    })
-  })
-  softphone.on('BYE', () => {
-    audioSink.stop()
-    audioStream.end()
-  })
+  const eventHistory = [];
 
-  const r = await rc.get('/restapi/v1.0/account/~/extension')
-  const json = await r.json()
-  const agentExt = json.records.filter(ext => ext.extensionNumber === process.env.RINGCENTRAL_AGENT_EXT)[0]
-  const subscriptions = new Subscriptions({
-    sdk: rc
-  })
-  const subscription = subscriptions.createSubscription({
-    pollInterval: 10 * 1000,
-    renewHandicapMs: 2 * 60 * 1000
-  })
-  subscription.setEventFilters([`/restapi/v1.0/account/~/extension/${agentExt.id}/telephony/sessions`])
-  subscription.on(subscription.events.notification, async function (message) {
-    if (message.body.parties.some(p => p.status.code === 'Answered' && p.direction === 'Inbound')) {
-      await rc.post(`/restapi/v1.0/account/~/telephony/sessions/${message.body.telephonySessionId}/supervise`, {
-        mode: 'Listen',
-        supervisorDeviceId: softphone.device.id,
-        agentExtensionNumber: agentExt.extensionNumber
-      })
+  request.on('close', () => {
+    closeConnection(response);
+  });
+
+  if (request.method === "GET") {
+    if (request.url.toLowerCase() === '/events') {
+      console.log("METHOD: " + request.method)
+      response.writeHead(200, {
+        'Connection': 'keep-alive',
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*'
+      });
+      eventResponse = response
+      checkConnectionToRestore(request, response, eventHistory);
+      console.log("LOGIN")
+      supervisor.initializePhoneEngine()
+
+    }else if (request.url.indexOf("/enable_translation") != -1){
+      console.log(request.url)
+      var queryData = url.parse(request.url, true).query;
+      console.log(queryData.enable)
+      supervisor.enableTranslation(queryData.enable)
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end();
+    }else if (request.url.indexOf("/recording") !== -1){
+      console.log(request.url)
+      var queryData = url.parse(request.url, true).query;
+      console.log(queryData.enable)
+      supervisor.enableRecording(queryData.enable)
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end();
+    }else{
+        console.log("Not GET nor POST method?")
+        response.writeHead(404);
+        response.end();
     }
-  })
-  await subscription.register()
-})()
+  }else if (request.method === "POST"){
+      if (request.url === "/webhookcallback") {
+        if(request.headers.hasOwnProperty("validation-token")) {
+            response.setHeader('Validation-Token', request.headers['validation-token']);
+            response.statusCode = 200;
+            response.end();
+        }else{
+          var body = []
+          request.on('data', function(chunk) {
+              body.push(chunk);
+            }).on('end', function() {
+              body = Buffer.concat(body).toString();
+              var jsonObj = JSON.parse(body)
+              for (var party of jsonObj.body.parties){
+                console.log("Receive session notification")
+                if (party.direction === "Inbound"){
+                  if (party.status.code === "Answered")
+                    supervisor.processTelephonySessionNotification(jsonObj.body)
+                  else if (party.status.code === "Proceeding")
+                    sendPhoneEvent("ringing")
+                  else if (party.status.code === "Disconnected")
+                    sendPhoneEvent("idle")
+                  else
+                    console.log(JSON.stringify(jsonObj.body))
+                  return
+                }else
+                  console.log(JSON.stringify(jsonObj.body))
+              }
+              //if (jsonObj.body.parties.some(p => p.status.code === 'Answered' && p.direction === 'Inbound'))
+              //  supervisor.processTelephonySessionNotification(jsonObj.body)
+              //else if (jsonObj.body.parties.some(p => p.status.code === 'Proceeding' && p.direction === 'Inbound'))
+              //  sendPhoneEvent("Ringing")
+              //else{
+                //sendPhoneEvent("ringing")
+              //  console.log(JSON.stringify(jsonObj.body))
+              //}
+
+            });
+        }
+      }
+  }else{
+      console.log("Not GET nor POST method?")
+      response.writeHead(404);
+      response.end();
+  }
+}).listen(5000, () => {
+  console.log('Server running at http://127.0.0.1:5000/');
+  //console.log("LOGIN")
+  //supervisor.login()
+});
+
+function sendPhoneEvent(status){
+  // status = [idle, ringing, connected]
+  var res = 'event: phoneEvent\ndata: {"status": "' + status + '"}\n\n'
+  console.log("sendPhoneEvent: " + res)
+  if (!eventResponse.finished) {
+      eventResponse.write(res);
+  }
+  if (status == "connected")
+    eventHistory = []
+}
+
+function sendEvents(transcript) {
+  //console.log(JSON.stringify(transcript))
+  var res = 'event: transcriptUpdate\ndata: ' + JSON.stringify(transcript) + '\n\n'
+  //console.log("sendEvents: " + res)
+  if (!eventResponse.finished) {
+      eventResponse.write(res);
+  }
+  if (transcript.status)
+    eventHistory.push(transcript);
+}
+
+function closeConnection(response) {
+  if (!response.finished) {
+    response.end();
+    console.log('Stopped sending events.');
+  }
+}
+
+function checkConnectionToRestore(request, response, eventHistory) {
+  if (request.headers['last-event-id']) {
+    const eventId = parseInt(request.headers['last-event-id']);
+
+    eventsToReSend = eventHistory.filter((e) => e.id > eventId);
+
+    eventsToReSend.forEach((e) => {
+      if (!response.finished) {
+        response.write(e);
+      }
+    });
+  }
+}
+
+module.exports.sendEvents = sendEvents;
+module.exports.sendPhoneEvent = sendPhoneEvent;

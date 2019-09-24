@@ -6,8 +6,12 @@
   "dependencies": {
     "@ringcentral/sdk": "^4.0.0-alpha.7",
     "@ringcentral/subscriptions": "^4.0.0-alpha.7",
+    "dotenv": "^8.1.0",
     "dotenv-override-true": "^6.2.0",
+    "ibm-watson": "^4.5.0",
+    "request": "^2.88.0",
     "ringcentral-softphone": "^0.1.6",
+    "watson-developer-cloud": "^4.0.1",
     "wrtc": "^0.4.2",
     "ws": "^7.1.2"
   },
